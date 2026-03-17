@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import sqlite3
 import math
+import numpy as np
 
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="Gate Fantasy", page_icon="⚽", layout="centered")
@@ -10,21 +11,27 @@ st.set_page_config(page_title="Gate Fantasy", page_icon="⚽", layout="centered"
 def init_db():
     conn = sqlite3.connect('fantasy.db', check_same_thread=False)
     c = conn.cursor()
-    # Users & Game State
+    # Users
     c.execute('''CREATE TABLE IF NOT EXISTS users 
                  (username TEXT PRIMARY KEY, password TEXT, team TEXT, captain TEXT, 
                   tc_available INTEGER DEFAULT 1, tc_active INTEGER DEFAULT 0, total_points REAL DEFAULT 0)''')
+    # Game State
     c.execute('''CREATE TABLE IF NOT EXISTS game_state 
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, round_name TEXT, subjects TEXT, is_active INTEGER DEFAULT 0)''')
+    # History
     c.execute('''CREATE TABLE IF NOT EXISTS score_history 
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, round_name TEXT, student TEXT, subject TEXT, mark REAL, points REAL)''')
-    
-    # NEW: Market Table for Player Prices
+    # Market
     c.execute('''CREATE TABLE IF NOT EXISTS market (name TEXT PRIMARY KEY, price REAL)''')
     
-    # Seed the market if it's empty (so you don't lose the initial list)
-    check_market = c.execute("SELECT COUNT(*) FROM market").fetchone()[0]
-    if check_market == 0:
+    # Migration for active rounds
+    cursor = conn.execute('PRAGMA table_info(game_state)')
+    cols = [info[1] for info in cursor.fetchall()]
+    if 'is_active' not in cols:
+        c.execute('ALTER TABLE game_state ADD COLUMN is_active INTEGER DEFAULT 0')
+
+    # Seed Market if empty
+    if c.execute("SELECT COUNT(*) FROM market").fetchone()[0] == 0:
         initial_players = [
             ("Ming", 36.0), ("Cirrus", 35.5), ("Gautham", 33.0), ("Dev", 32.5), ("Forrest", 30.0), 
             ("Talal", 28.5), ("Geonhee", 27.0), ("Hardy", 23.0), ("Ethan Yuen", 22.5), ("Abdul", 22.0), 
@@ -35,22 +42,15 @@ def init_db():
             ("Sanjit", 10.5), ("Yashwant", 10.5), ("Maxi", 10.0), ("Raymond", 9.5), ("Hassan", 9.0), ("Lucas Kong", 8.0)
         ]
         c.executemany("INSERT INTO market (name, price) VALUES (?,?)", initial_players)
-    
-    # Migration for game_state
-    cursor = conn.execute('PRAGMA table_info(game_state)')
-    cols = [info[1] for info in cursor.fetchall()]
-    if 'is_active' not in cols:
-        c.execute('ALTER TABLE game_state ADD COLUMN is_active INTEGER DEFAULT 0')
-        
     conn.commit()
     return conn
 
 db_conn = init_db()
 
-# --- ADMIN PASSWORD ---
+# --- ADMIN SECURITY ---
 ADMIN_PASSWORD = st.secrets.get("ADMIN_KEY", "vinodbox43")
 
-# --- FETCH DYNAMIC MARKET DATA ---
+# --- DATA FETCHING ---
 market_df = pd.read_sql("SELECT * FROM market ORDER BY price DESC", db_conn)
 player_prices = dict(zip(market_df['name'], market_df['price']))
 player_options = [f"{row['name']} (£{row['price']}m)" for _, row in market_df.iterrows()]
@@ -59,7 +59,31 @@ def calculate_fpl_points(mark):
     diff = mark - 70
     return 4 * math.pow(diff, 1.2) if diff >= 0 else -4 * math.pow(abs(diff), 1.2)
 
-# --- STYLE ---
+# --- BELL CURVE LOGIC ---
+def run_bell_curve(round_name):
+    df_scores = pd.read_sql("SELECT student, mark FROM score_history WHERE round_name=?", db_conn, params=(round_name,))
+    if df_scores.empty: return []
+    stats = df_scores.groupby('student')['mark'].mean().reset_index()
+    mean, std = stats['mark'].mean(), stats['mark'].std()
+    if std == 0 or pd.isna(std): std = 1
+    
+    updates = []
+    c = db_conn.cursor()
+    for _, row in stats.iterrows():
+        z = (row['mark'] - mean) / std
+        if z > 1.5: change = 5.0
+        elif z > 0.5: change = 2.0
+        elif z > -0.5: change = 0.0
+        elif z > -1.5: change = -2.0
+        else: change = -5.0
+        
+        if change != 0:
+            c.execute("UPDATE market SET price = MAX(5.0, price + ?) WHERE name = ?", (change, row['student']))
+            updates.append(f"{'📈' if change > 0 else '📉'} {row['student']}: {change:+}m")
+    db_conn.commit()
+    return updates
+
+# --- UI STYLING ---
 st.markdown("""<style>
     .stApp { background-color: #FFFFFF; }
     label, p, .stMarkdown { color: #000000 !important; font-weight: 700 !important; }
@@ -86,32 +110,42 @@ if not st.session_state.auth:
         if st.button("Register"):
             try:
                 db_conn.execute("INSERT INTO users (username, password, team, captain) VALUES (?, ?, 'None', 'None')", (nu, np))
-                db_conn.commit()
-                st.success("Registered!")
+                db_conn.commit(); st.success("Registered!")
             except: st.error("User exists.")
 else:
     u_data = pd.read_sql("SELECT * FROM users WHERE username=?", db_conn, params=(st.session_state.user,)).iloc[0]
     active_q = pd.read_sql("SELECT * FROM game_state WHERE is_active=1 LIMIT 1", db_conn)
     info = active_q.iloc[0] if not active_q.empty else {"round_name": "Round 1", "subjects": "Maths"}
 
+    st.sidebar.title(f"Hi, {st.session_state.user}")
+    st.sidebar.write(f"Total Points: {round(float(u_data['total_points']), 2)}")
+    
     page = st.sidebar.radio("Nav", ["Dashboard", "Leaderboard", "Player Stats", "Grade Portal", "My Squad", "Review Teams", "Admin"])
 
-    # ... [Dashboard, Leaderboard, Player Stats, Grade Portal, My Squad, Review Teams logic remains identical to previous version] ...
-    # (Note: They all now use the dynamic player_options and player_prices fetched from the DB)
-
     if page == "Dashboard":
-        st.markdown('<div class="fpl-header"><h1 style="color:#00ff87;">GATE FANTASY</h1></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="fpl-header"><h1 style="color:#00ff87;">{info["round_name"]}</h1></div>', unsafe_allow_html=True)
         st.metric("Current Round", info['round_name'])
-        st.info(f"📍 Active Subjects: {info['subjects']}")
+        st.info(f"📍 Subjects: {info['subjects']}")
+        st.subheader("Recent Scores")
         hist = pd.read_sql("SELECT student, subject, mark, points FROM score_history ORDER BY id DESC LIMIT 5", db_conn)
         if not hist.empty: st.table(hist)
 
     elif page == "Leaderboard":
         st.header("🏆 Standings")
         ld_df = pd.read_sql("SELECT username as Manager, total_points as Points FROM users ORDER BY total_points DESC", db_conn)
-        if not ld_df.empty:
-            ld_df['Points'] = pd.to_numeric(ld_df['Points']).round(2)
-            st.dataframe(ld_df, use_container_width=True, hide_index=True)
+        st.dataframe(ld_df, use_container_width=True, hide_index=True)
+
+    elif page == "Player Stats":
+        st.header("📊 Student Performance")
+        stats = pd.read_sql("SELECT student as Name, SUM(points) as Total_Points FROM score_history GROUP BY student ORDER BY Total_Points DESC", db_conn)
+        st.dataframe(stats, use_container_width=True, hide_index=True)
+
+    elif page == "Grade Portal":
+        st.header("📝 Subject Averages")
+        raw = pd.read_sql("SELECT student, subject, mark FROM score_history", db_conn)
+        if not raw.empty:
+            pivot = raw.pivot_table(index='student', columns='subject', values='mark', aggfunc='mean').fillna("-")
+            st.dataframe(pivot, use_container_width=True)
 
     elif page == "My Squad":
         st.markdown(f'<div class="card"><b>Team:</b> {u_data["team"]}<br><b>Captain:</b> {u_data["captain"]}</div>', unsafe_allow_html=True)
@@ -124,45 +158,88 @@ else:
         
         if st.button("Save Squad"):
             if len(s_names) == 5 and cost <= 90:
-                c = db_conn.cursor()
-                c.execute("UPDATE users SET team=?, captain=? WHERE username=?", (", ".join(s_names), cap_choice, st.session_state.user))
+                db_conn.execute("UPDATE users SET team=?, captain=? WHERE username=?", (", ".join(s_names), cap_choice, st.session_state.user))
                 db_conn.commit(); st.success("Squad Saved!"); st.rerun()
+
+    elif page == "Review Teams":
+        st.header("👀 Manager Teams")
+        others = pd.read_sql("SELECT username, team, captain FROM users WHERE team != 'None'", db_conn)
+        for _, row in others.iterrows():
+            with st.expander(row['username']):
+                st.write(f"**Team:** {row['team']} | **Captain:** {row['captain']}")
 
     elif page == "Admin":
         st.header("🔐 Admin Controls")
         if st.text_input("Enter Admin Key", type="password") == ADMIN_PASSWORD:
-            t1, t2, t3, t4, t5, t6 = st.tabs(["Set Round", "Round Archives", "Apply Score", "User Tools", "Market Manager", "Reset"])
+            t1, t2, t3, t4, t5 = st.tabs(["Rounds", "Scoring", "User Management", "Market", "Danger Zone"])
             
-            with t3: # Apply Score
-                st.subheader("Add Score")
+            with t1: # Rounds
+                st.subheader("Transition Round")
+                nr = st.text_input("New Round Name")
+                ns = st.text_input("New Subjects")
+                if st.button("End Current & Start New (Run Bell Curve)"):
+                    reports = run_bell_curve(info['round_name'])
+                    db_conn.execute("UPDATE game_state SET is_active=0")
+                    db_conn.execute("INSERT INTO game_state (round_name, subjects, is_active) VALUES (?,?,1)", (nr, ns))
+                    db_conn.commit()
+                    for r in reports: st.info(r)
+                    st.success("New Round Started!"); st.rerun()
+
+            with t2: # Scoring
+                st.subheader("Upload Grade")
                 st_n = st.selectbox("Student", list(player_prices.keys()))
-                sub_list = [s.strip() for s in info['subjects'].replace(",", " ").split(" ") if s.strip()]
-                sub_n = st.selectbox("Select Subject", list(set(sub_list)))
+                subs = [s.strip() for s in info['subjects'].replace(",", " ").split(" ") if s.strip()]
+                sub_n = st.selectbox("Subject", list(set(subs)))
                 mk = st.number_input("Mark", 0.0, 100.0)
                 if st.button("Apply Score"):
-                    c = db_conn.cursor()
-                    new_pts = calculate_fpl_points(mk)
-                    c.execute("INSERT INTO score_history (round_name, student, subject, mark, points) VALUES (?,?,?,?,?)", (info['round_name'], st_n, sub_n, mk, new_pts))
-                    # Distribute points...
-                    for u_n, u_t, u_c in c.execute("SELECT username, team, captain FROM users").fetchall():
+                    pts = calculate_fpl_points(mk)
+                    db_conn.execute("INSERT INTO score_history (round_name, student, subject, mark, points) VALUES (?,?,?,?,?)", (info['round_name'], st_n, sub_n, mk, pts))
+                    # Add points to managers
+                    for u_n, u_t, u_c in db_conn.execute("SELECT username, team, captain FROM users").fetchall():
                         if u_t and st_n in u_t:
                             m = 2 if st_n == u_c else 1
-                            c.execute("UPDATE users SET total_points = total_points + ? WHERE username=?", (new_pts * m, u_n))
-                    db_conn.commit(); st.success(f"Score added!")
+                            db_conn.execute("UPDATE users SET total_points = total_points + ? WHERE username=?", (pts * m, u_n))
+                    db_conn.commit(); st.success("Score Added!")
 
-            with t5: # Market Manager
-                st.subheader("Edit Player Prices")
-                st.write("Current Market:")
-                st.dataframe(market_df, hide_index=True)
-                
-                col1, col2 = st.columns(2)
-                p_to_edit = col1.selectbox("Select Student to Price Change", market_df['name'].tolist())
-                new_price = col2.number_input("New Price (£m)", value=player_prices[p_to_edit])
-                
-                if st.button("Update Price"):
-                    db_conn.execute("UPDATE market SET price=? WHERE name=?", (new_price, p_to_edit))
-                    db_conn.commit()
-                    st.success(f"Updated {p_to_edit} to £{new_price}m")
-                    st.rerun()
+            with t3: # User Management
+                st.subheader("Manager Tools")
+                u_list = pd.read_sql("SELECT username, password, total_points FROM users", db_conn)
+                st.dataframe(u_list)
+                target = st.selectbox("Select Manager", u_list['username'].tolist())
+                new_pass = st.text_input("Change Password")
+                if st.button("Update Password"):
+                    db_conn.execute("UPDATE users SET password=? WHERE username=?", (new_pass, target))
+                    db_conn.commit(); st.success("Updated")
+                if st.button("Kick Player (Delete User)"):
+                    db_conn.execute("DELETE FROM users WHERE username=?", (target,))
+                    db_conn.commit(); st.warning(f"{target} removed."); st.rerun()
 
-            # (Rest of admin tabs t1, t2, t4, t6 remain the same)
+            with t4: # Market
+                st.subheader("Manual Price Fix")
+                p_target = st.selectbox("Student", list(player_prices.keys()))
+                p_new = st.number_input("New Price", value=player_prices[p_target])
+                if st.button("Save Price"):
+                    db_conn.execute("UPDATE market SET price=? WHERE name=?", (p_new, p_target))
+                    db_conn.commit(); st.rerun()
+
+            with t5: # Danger Zone
+                st.subheader("Reset Commands")
+                if st.button("Reset Current Round Scores"):
+                    db_conn.execute("DELETE FROM score_history WHERE round_name=?", (info['round_name'],))
+                    db_conn.commit(); st.warning("Current round scores wiped. Remember to Recalculate Pts!")
+                
+                if st.button("🛠️ FULL RECALCULATE (Leaderboard)"):
+                    db_conn.execute("UPDATE users SET total_points = 0")
+                    history = db_conn.execute("SELECT student, points, round_name FROM score_history").fetchall()
+                    for s_n, pts, r_n in history:
+                        for u_n, u_t, u_c in db_conn.execute("SELECT username, team, captain FROM users").fetchall():
+                            if u_t and s_n in u_t:
+                                m = 2 if s_n == u_c else 1
+                                db_conn.execute("UPDATE users SET total_points = total_points + ? WHERE username=?", (pts * m, u_n))
+                    db_conn.commit(); st.success("Leaderboard Rebuilt!")
+
+                if st.button("⚠️ NUCLEAR RESET (Delete All Data)"):
+                    db_conn.execute("DELETE FROM users")
+                    db_conn.execute("DELETE FROM score_history")
+                    db_conn.execute("DELETE FROM game_state")
+                    db_conn.commit(); st.error("System Reset Complete."); st.rerun()
