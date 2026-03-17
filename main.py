@@ -24,22 +24,26 @@ def init_db():
 db_conn = init_db()
 ADMIN_PASSWORD = st.secrets.get("ADMIN_KEY", "vinodbox43")
 
-# --- CORE LOGIC ---
-def calculate_fpl_points(mark):
-    diff = mark - 70
-    return 4 * math.pow(diff, 1.2) if diff >= 0 else -4 * math.pow(abs(diff), 1.2)
-
-def run_bell_curve(round_name):
+# --- BELL CURVE ENGINE (RESTORED) ---
+def run_bell_curve_fluctuation(round_name):
     df_scores = pd.read_sql("SELECT student, mark FROM score_history WHERE round_name=?", db_conn, params=(round_name,))
-    if df_scores.empty: return []
+    if df_scores.empty:
+        return ["No scores found for bell curve."]
+
+    # Calculate average mark per student for the round
     stats = df_scores.groupby('student')['mark'].mean().reset_index()
-    mean, std = stats['mark'].mean(), stats['mark'].std()
-    if std == 0 or pd.isna(std): std = 1
+    marks = stats['mark']
+    mean = marks.mean()
+    std = marks.std() if marks.std() > 0 else 1 
     
     updates = []
     c = db_conn.cursor()
+
     for _, row in stats.iterrows():
-        z = (row['mark'] - mean) / std
+        name = row['student']
+        z = (row['mark'] - mean) / std # Z-Score calculation
+        
+        # Bell Curve Mapping (Lucas & Geonhee's +/- 5m Balanced scale)
         if z > 1.5: change = 5.0
         elif z > 0.5: change = 2.0
         elif z > -0.5: change = 0.0
@@ -47,27 +51,28 @@ def run_bell_curve(round_name):
         else: change = -5.0
         
         if change != 0:
-            c.execute("UPDATE market SET price = MAX(5.0, price + ?) WHERE name = ?", (change, row['student']))
-            updates.append(f"{'📈' if change > 0 else '📉'} {row['student']}: {change:+}m")
+            c.execute("UPDATE market SET price = MAX(5.0, price + ?) WHERE name = ?", (change, name))
+            updates.append(f"{'📈' if change > 0 else '📉'} {name}: {change:+}m (Z: {z:.2f})")
+    
     db_conn.commit()
     return updates
 
-# --- DATA FETCH ---
+def calculate_fpl_points(mark):
+    diff = mark - 70
+    return 4 * math.pow(diff, 1.2) if diff >= 0 else -4 * math.pow(abs(diff), 1.2)
+
+# --- DATA REFRESH ---
 market_df = pd.read_sql("SELECT * FROM market ORDER BY price DESC", db_conn)
 player_prices = dict(zip(market_df['name'], market_df['price']))
 player_options = [f"{n} (£{p}m)" for n, p in player_prices.items()]
 active_q = pd.read_sql("SELECT * FROM game_state WHERE is_active=1 LIMIT 1", db_conn)
 info = active_q.iloc[0] if not active_q.empty else {"round_name": "Round 1", "subjects": "Maths"}
 
-# --- STYLE ---
-st.markdown("""<style>
-    .stApp { background-color: #FFFFFF; }
-    .fpl-header { background: #38003c; padding: 20px; border-radius: 10px; text-align: center; color: white; border-bottom: 5px solid #00ff87; }
-    </style>""", unsafe_allow_html=True)
+# --- UI ---
+st.markdown("""<style> .stApp { background-color: #FFFFFF; } .fpl-header { background: #38003c; padding: 20px; border-radius: 10px; text-align: center; color: white; border-bottom: 5px solid #00ff87; } </style>""", unsafe_allow_html=True)
 
 if 'auth' not in st.session_state: st.session_state.auth = False
 
-# --- APP ---
 if not st.session_state.auth:
     st.markdown('<div class="fpl-header"><h1>GATE FANTASY</h1></div>', unsafe_allow_html=True)
     u_in, p_in = st.text_input("Username"), st.text_input("Password", type="password")
@@ -98,12 +103,10 @@ else:
         cur_team = u_data['team'].split(", ") if u_data['team'] and u_data['team'] != 'None' else []
         st.write(f"**Current Team:** {', '.join(cur_team)}")
         if u_data['pending_team']: st.warning(f"⏳ Pending: {u_data['pending_team']}")
-        
         sel = st.multiselect("Pick 5 Players", player_options, max_selections=5)
         new_names = [s.split(" (£")[0] for s in sel]
         cap_choice = st.selectbox("Select Captain", new_names if new_names else (cur_team if cur_team else ["None"]))
         tc_on = st.checkbox("Activate Triple Captain?") if u_data['tc_available'] else False
-        
         if st.button("Submit Request"):
             if len(new_names) == 5:
                 diff = len(set(new_names) - set(cur_team)) if cur_team else 0
@@ -115,9 +118,25 @@ else:
 
     elif page == "Admin":
         if st.text_input("Admin Key", type="password") == ADMIN_PASSWORD:
-            t1, t2, t3, t4, t5 = st.tabs(["Approvals", "Round Archives", "Apply Score", "User Tools", "Reset"])
+            tabs = st.tabs(["Approvals", "Round Archives", "Apply Score", "User Tools", "Reset"])
             
-            with t4: # User Tools
+            with tabs[1]: # ROUND ARCHIVES & BELL CURVE
+                nr, ns = st.text_input("Next Round Name"), st.text_input("Subjects")
+                if st.button("Start New Round (Apply Bell Curve)"):
+                    for m_n, m_t in db_conn.execute("SELECT username, team FROM users").fetchall():
+                        if m_t and m_t != 'None':
+                            val = sum(player_prices.get(p, 0) for p in m_t.split(", "))
+                            db_conn.execute("INSERT INTO budget_history (username, round_name, total_value) VALUES (?,?,?)", (m_n, info['round_name'], val))
+                    db_conn.execute("UPDATE users SET tc_available=0 WHERE tc_active=1")
+                    db_conn.execute("UPDATE users SET tc_active=0")
+                    # TRIGGER BELL CURVE
+                    reports = run_bell_curve_fluctuation(info['round_name'])
+                    for r in reports: st.info(r)
+                    db_conn.execute("UPDATE game_state SET is_active=0")
+                    db_conn.execute("INSERT INTO game_state (round_name, subjects, is_active) VALUES (?,?,1)", (nr, ns))
+                    db_conn.commit(); st.rerun()
+
+            with tabs[3]: # USER TOOLS
                 u_df = pd.read_sql("SELECT username, password, tc_available, total_points FROM users", db_conn)
                 st.dataframe(u_df, use_container_width=True)
                 target = st.selectbox("Select User", u_df['username'].tolist())
@@ -127,10 +146,9 @@ else:
                     db_conn.commit(); st.success("Changed!")
                 if st.button("Restore TC Chip"):
                     db_conn.execute("UPDATE users SET tc_available=1 WHERE username=?", (target,))
-                    db_conn.commit(); st.info("TC Chip Restored.")
+                    db_conn.commit(); st.success("TC Restored.")
 
-            with t5: # RESTORED: Recalculate Logic
-                st.subheader("Danger Zone")
+            with tabs[4]: # RESET & RECALCULATE
                 if st.button("🛠️ Full System Recalculate"):
                     db_conn.execute("UPDATE users SET total_points = 0")
                     history = db_conn.execute("SELECT round_name, student, points FROM score_history").fetchall()
@@ -139,36 +157,4 @@ else:
                             if u_t and s_n in u_t:
                                 mult = 3 if (s_n == u_c and u_tc == 1) else (2 if s_n == u_c else 1)
                                 db_conn.execute("UPDATE users SET total_points = total_points + ? WHERE username=?", (pts * mult, u_n))
-                    db_conn.commit(); st.success("Leaderboard Recalculated!")
-                
-                if st.button("Reset Current Round Scores"):
-                    db_conn.execute("DELETE FROM score_history WHERE round_name=?", (info['round_name'],))
-                    db_conn.commit(); st.warning("Current round scores wiped.")
-
-            with t2: # Round archives
-                nr, ns = st.text_input("New Round Name"), st.text_input("Subjects")
-                if st.button("Start New Round"):
-                    for m_n, m_t in db_conn.execute("SELECT username, team FROM users").fetchall():
-                        if m_t and m_t != 'None':
-                            val = sum(player_prices.get(p, 0) for p in m_t.split(", "))
-                            db_conn.execute("INSERT INTO budget_history (username, round_name, total_value) VALUES (?,?,?)", (m_n, info['round_name'], val))
-                    db_conn.execute("UPDATE users SET tc_available=0 WHERE tc_active=1")
-                    db_conn.execute("UPDATE users SET tc_active=0")
-                    run_bell_curve(info['round_name'])
-                    db_conn.execute("UPDATE game_state SET is_active=0")
-                    db_conn.execute("INSERT INTO game_state (round_name, subjects, is_active) VALUES (?,?,1)", (nr, ns))
-                    db_conn.commit(); st.rerun()
-
-            with t3: # Apply Score
-                st_n = st.selectbox("Student", list(player_prices.keys()))
-                subs = [s.strip() for s in info['subjects'].replace(",", " ").split() if s.strip()]
-                sub_n = st.selectbox("Subject", list(set(subs)))
-                mk = st.number_input("Mark", 0.0, 100.0)
-                if st.button("Apply Score"):
-                    pts = calculate_fpl_points(mk)
-                    db_conn.execute("INSERT INTO score_history (round_name, student, subject, mark, points) VALUES (?,?,?,?,?)", (info['round_name'], st_n, sub_n, mk, pts))
-                    for u_n, u_t, u_c, u_tc in db_conn.execute("SELECT username, team, captain, tc_active FROM users").fetchall():
-                        if u_t and st_n in u_t:
-                            mult = 3 if (st_n == u_c and u_tc == 1) else (2 if st_n == u_c else 1)
-                            db_conn.execute("UPDATE users SET total_points = total_points + ? WHERE username=?", (pts * mult, u_n))
-                    db_conn.commit(); st.success("Score Applied!")
+                    db_conn.commit(); st.success("Recalculated!")
