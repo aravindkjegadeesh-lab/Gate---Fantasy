@@ -10,27 +10,22 @@ st.set_page_config(page_title="Gate Fantasy", page_icon="⚽", layout="centered"
 def init_db():
     conn = sqlite3.connect('fantasy.db', check_same_thread=False)
     c = conn.cursor()
-    # Core Tables
     c.execute('''CREATE TABLE IF NOT EXISTS users 
                  (username TEXT PRIMARY KEY, password TEXT, team TEXT, captain TEXT, 
                   tc_available INTEGER DEFAULT 1, tc_active INTEGER DEFAULT 0, total_points REAL DEFAULT 0)''')
-    
     c.execute('''CREATE TABLE IF NOT EXISTS game_state 
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, round_name TEXT, subjects TEXT, is_active INTEGER DEFAULT 0)''')
-    
     c.execute('''CREATE TABLE IF NOT EXISTS score_history 
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, round_name TEXT, student TEXT, subject TEXT, mark REAL, points REAL)''')
     
-    # FIX: Check if we need to migrate the old game_state table
+    # MIGRATION: Auto-fix old game_state structure
     cursor = conn.execute('PRAGMA table_info(game_state)')
-    columns = [info[1] for info in cursor.fetchall()]
-    if 'is_active' not in columns:
-        # If it's the old 1-row table, we convert it
+    cols = [info[1] for info in cursor.fetchall()]
+    if 'is_active' not in cols:
         c.execute('DROP TABLE game_state')
         c.execute('''CREATE TABLE game_state 
                      (id INTEGER PRIMARY KEY AUTOINCREMENT, round_name TEXT, subjects TEXT, is_active INTEGER DEFAULT 1)''')
         c.execute("INSERT INTO game_state (round_name, subjects, is_active) VALUES ('Round 1', 'Maths', 1)")
-    
     conn.commit()
     return conn
 
@@ -147,7 +142,7 @@ else:
         if st.button("Save Squad"):
             if len(s_names) == 5 and cost <= 90:
                 c = db_conn.cursor()
-                # Late-joiner catchup logic
+                # Catch-up for current round
                 round_scores = c.execute("SELECT student, points FROM score_history WHERE round_name=?", (info['round_name'],)).fetchall()
                 total_catchup = 0
                 for s_n, s_p in round_scores:
@@ -208,7 +203,6 @@ else:
                 mk = st.number_input("Mark", 0.0, 100.0)
                 if st.button("Apply Score"):
                     c = db_conn.cursor()
-                    # Existing overwrite logic
                     new_pts = calculate_fpl_points(mk)
                     c.execute("INSERT INTO score_history (round_name, student, subject, mark, points) VALUES (?,?,?,?,?)", (info['round_name'], st_n, sub_n, mk, new_pts))
                     for u_n, u_t, u_c, u_tc_act in c.execute("SELECT username, team, captain, tc_active FROM users").fetchall():
@@ -218,14 +212,22 @@ else:
                     db_conn.commit(); st.success("Done!")
 
             with t4:
-                u_df = pd.read_sql("SELECT username, total_points, tc_available FROM users", db_conn)
+                # VIEW PASSWORDS INCLUDED HERE
+                u_df = pd.read_sql("SELECT username, password, total_points, tc_available FROM users", db_conn)
                 st.dataframe(u_df, use_container_width=True)
+                
                 target = st.selectbox("User", u_df['username'].tolist())
-                adj = st.number_input("Manual Adjust", value=0.0)
-                if st.button("Fix Pts"):
+                new_p = st.text_input("Change Password (New Pass)")
+                adj = st.number_input("Manual Adjust Pts", value=0.0)
+                
+                c1, c2, c3 = st.columns(3)
+                if c1.button("Update Pass"):
+                    db_conn.execute("UPDATE users SET password=? WHERE username=?", (new_p, target))
+                    db_conn.commit(); st.success("Pass Updated!")
+                if c2.button("Fix Pts"):
                     db_conn.execute("UPDATE users SET total_points = total_points + ? WHERE username=?", (adj, target))
                     db_conn.commit(); st.rerun()
-                if st.button("Restore TC"):
+                if c3.button("Restore TC"):
                     db_conn.execute("UPDATE users SET tc_available=1, tc_active=0 WHERE username=?", (target,))
                     db_conn.commit(); st.success("TC Refilled")
 
@@ -239,4 +241,4 @@ else:
                             if u_t and s_name in u_t:
                                 m = 3 if (s_name == u_c and u_tc_av == 0) else (2 if s_name == u_c else 1)
                                 c.execute("UPDATE users SET total_points = total_points + ? WHERE username=?", (s_pts * m, u_n))
-                    db_conn.commit(); st.success("Rebuilt!"); st.rerun()
+                    db_conn.commit(); st.success("Leaderboard Rebuilt!"); st.rerun()
