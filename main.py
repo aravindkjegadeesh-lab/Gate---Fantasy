@@ -80,7 +80,7 @@ else:
     info = state_query.iloc[0] if not state_query.empty else {"current_round": "Round 1", "subjects": "Maths"}
 
     st.sidebar.title(f"Hi, {st.session_state.user}")
-    st.sidebar.write(f"Points: {round(u_data['total_points'], 2)}")
+    st.sidebar.write(f"Points: {round(float(u_data['total_points']), 2)}")
     
     page = st.sidebar.radio("Nav", ["Dashboard", "Leaderboard", "Player Stats", "Grade Portal", "My Squad", "Review Teams", "Admin"])
 
@@ -94,19 +94,28 @@ else:
     elif page == "Leaderboard":
         st.header("🏆 Standings")
         ld_df = pd.read_sql("SELECT username as Manager, total_points as Points FROM users ORDER BY total_points DESC", db_conn)
-        ld_df['Points'] = ld_df['Points'].round(2)
-        st.dataframe(ld_df, use_container_width=True, hide_index=True)
+        if not ld_df.empty:
+            ld_df['Points'] = pd.to_numeric(ld_df['Points']).round(2)
+            st.dataframe(ld_df, use_container_width=True, hide_index=True)
+        else: st.write("No managers yet.")
 
     elif page == "Player Stats":
         st.header("📊 Total Student Points")
         stats = pd.read_sql("SELECT student as Name, SUM(points) as Total_Points FROM score_history GROUP BY student ORDER BY Total_Points DESC", db_conn)
-        stats['Total_Points'] = stats['Total_Points'].round(2)
-        st.dataframe(stats, use_container_width=True, hide_index=True)
+        if not stats.empty:
+            # FIX: Convert to numeric before rounding to prevent the crash in your screenshot
+            stats['Total_Points'] = pd.to_numeric(stats['Total_Points']).round(2)
+            st.dataframe(stats, use_container_width=True, hide_index=True)
+        else: st.info("No scores recorded yet.")
 
     elif page == "Grade Portal":
         st.header("📝 Grade History")
         raw = pd.read_sql("SELECT student, subject, mark FROM score_history", db_conn)
-        if not raw.empty: st.dataframe(raw.pivot_table(index='student', columns='subject', values='mark').fillna("-"), use_container_width=True)
+        if not raw.empty:
+            # FIX: Ensure unique index/columns for pivot to handle different score categories
+            pivot_table = raw.pivot_table(index='student', columns='subject', values='mark', aggfunc='first').fillna("-")
+            st.dataframe(pivot_table, use_container_width=True)
+        else: st.info("History is empty.")
 
     elif page == "My Squad":
         st.markdown(f'<div class="card"><b>Team:</b> {u_data["team"]}<br><b>Captain:</b> {u_data["captain"]}</div>', unsafe_allow_html=True)
@@ -140,7 +149,7 @@ else:
                 c.execute("UPDATE users SET team=?, captain=?, tc_active=? WHERE username=?", 
                                 (", ".join(s_names), cap_choice, tc_active_val, st.session_state.user))
                 
-                if u_data['team'] == 'None': # Only add points if they didn't have a team yet
+                if u_data['team'] == 'None' or u_data['team'] == '': 
                     c.execute("UPDATE users SET total_points = total_points + ? WHERE username=?", (total_catchup, st.session_state.user))
                 
                 if tc_active_val == 1:
@@ -198,22 +207,6 @@ else:
                                 c.execute("UPDATE users SET tc_available=0, tc_active=0 WHERE username=?", (u_n,))
                     db_conn.commit(); st.success("Score Applied!")
 
-                st.markdown("---")
-                st.subheader("🔴 DELETE SCORES")
-                del_st = st.selectbox("Student", [p['name'] for p in MARKET_DATA], key="dst")
-                del_sub = st.selectbox("Entry", sub_opts, key="dsub")
-                if st.button("🔴 Wipe Score"):
-                    c = db_conn.cursor()
-                    found = c.execute("SELECT points FROM score_history WHERE student=? AND subject=?", (del_st, del_sub)).fetchone()
-                    if found:
-                        pts = found[0]
-                        for u_n, u_t, u_c, u_tc_av, u_tc_act in c.execute("SELECT username, team, captain, tc_available, tc_active FROM users").fetchall():
-                            if u_t and del_st in u_t:
-                                m = 3 if (del_st == u_c and (u_tc_act == 1 or u_tc_av == 0)) else (2 if del_st == u_c else 1)
-                                c.execute("UPDATE users SET total_points = total_points - ? WHERE username=?", (pts * m, u_n))
-                        c.execute("DELETE FROM score_history WHERE student=? AND subject=?", (del_st, del_sub))
-                        db_conn.commit(); st.warning("Deleted."); st.rerun()
-
             with t3:
                 u_df = pd.read_sql("SELECT username, password, total_points, tc_available, tc_active FROM users", db_conn)
                 st.dataframe(u_df, use_container_width=True)
@@ -230,18 +223,14 @@ else:
                 st.subheader("Leaderboard Repair")
                 if st.button("🛠️ RECALCULATE ALL TOTALS"):
                     c = db_conn.cursor()
-                    # 1. Zero out everyone
                     c.execute("UPDATE users SET total_points = 0")
-                    # 2. Get every score ever recorded
                     history = c.execute("SELECT student, points FROM score_history").fetchall()
                     for s_name, s_pts in history:
-                        # Find users who have this student
                         for u_n, u_t, u_c, u_tc_av in c.execute("SELECT username, team, captain, tc_available FROM users").fetchall():
                             if u_t and s_name in u_t:
-                                # We assume TC was used if it's currently unavailable and they were captain
                                 m = 3 if (s_name == u_c and u_tc_av == 0) else (2 if s_name == u_c else 1)
                                 c.execute("UPDATE users SET total_points = total_points + ? WHERE username=?", (s_pts * m, u_n))
-                    db_conn.commit(); st.success("Leaderboard rebuilt from history!"); st.rerun()
+                    db_conn.commit(); st.success("Rebuilt!"); st.rerun()
                 
                 st.markdown("---")
                 if st.button("⚠️ FULL DATABASE WIPE"):
