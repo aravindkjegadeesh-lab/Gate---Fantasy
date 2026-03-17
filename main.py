@@ -18,21 +18,21 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS score_history 
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, round_name TEXT, student TEXT, subject TEXT, mark REAL, points REAL)''')
     
-    # MIGRATION: Auto-fix old game_state structure
+    # MIGRATION: This checks if the new column exists so it doesn't crash OR wipe your data
     cursor = conn.execute('PRAGMA table_info(game_state)')
     cols = [info[1] for info in cursor.fetchall()]
     if 'is_active' not in cols:
-        c.execute('DROP TABLE game_state')
+        # We rename the old one to keep data safe, then merge if needed
+        c.execute('ALTER TABLE game_state RENAME TO old_game_state')
         c.execute('''CREATE TABLE game_state 
                      (id INTEGER PRIMARY KEY AUTOINCREMENT, round_name TEXT, subjects TEXT, is_active INTEGER DEFAULT 1)''')
-        c.execute("INSERT INTO game_state (round_name, subjects, is_active) VALUES ('Round 1', 'Maths', 1)")
+        c.execute("INSERT INTO game_state (round_name, subjects, is_active) SELECT round_name, subjects, 1 FROM old_game_state")
     conn.commit()
     return conn
 
 db_conn = init_db()
 
 # --- ADMIN PASSWORD SECURITY ---
-# This pulls from Streamlit's secrets. If not set, it defaults to your old one.
 ADMIN_PASSWORD = st.secrets.get("ADMIN_KEY", "vinodbox43")
 
 def calculate_fpl_points(mark):
@@ -68,7 +68,7 @@ st.markdown("""<style>
 if 'auth' not in st.session_state: st.session_state.auth = False
 if 'user' not in st.session_state: st.session_state.user = None
 
-# --- AUTH ---
+# --- AUTH & MAIN APP ---
 if not st.session_state.auth:
     st.markdown('<div class="fpl-header"><h1 style="color:#00ff87;">GATE FANTASY</h1></div>', unsafe_allow_html=True)
     t1, t2 = st.tabs(["Login", "Sign Up"])
@@ -115,14 +115,15 @@ else:
         st.header("📊 Total Student Points")
         stats = pd.read_sql("SELECT student as Name, SUM(points) as Total_Points FROM score_history GROUP BY student ORDER BY Total_Points DESC", db_conn)
         if not stats.empty:
-            stats['Total_Points'] = pd.to_numeric(stats['Total_Points']).round(2) #
+            stats['Total_Points'] = pd.to_numeric(stats['Total_Points']).round(2)
             st.dataframe(stats, use_container_width=True, hide_index=True)
 
     elif page == "Grade Portal":
         st.header("📝 Grade History")
         raw = pd.read_sql("SELECT student, subject, mark FROM score_history", db_conn)
         if not raw.empty:
-            pivot_table = raw.pivot_table(index='student', columns='subject', values='mark', aggfunc='first').fillna("-") #
+            # FIX: This prevents duplicate columns from crashing the pivot
+            pivot_table = raw.pivot_table(index='student', columns='subject', values='mark', aggfunc='first').fillna("-")
             st.dataframe(pivot_table, use_container_width=True)
 
     elif page == "My Squad":
@@ -146,6 +147,7 @@ else:
         if st.button("Save Squad"):
             if len(s_names) == 5 and cost <= 90:
                 c = db_conn.cursor()
+                # Catch-up logic for current round scores
                 round_scores = c.execute("SELECT student, points FROM score_history WHERE round_name=?", (info['round_name'],)).fetchall()
                 total_catchup = 0
                 for s_n, s_p in round_scores:
@@ -174,14 +176,13 @@ else:
 
     elif page == "Admin":
         st.header("🔐 Admin Controls")
-        # Masked input for password and using the secured ADMIN_PASSWORD variable
         if st.text_input("Enter Admin Key", type="password") == ADMIN_PASSWORD:
             t1, t2, t3, t4, t5 = st.tabs(["Set Round", "Round Archives", "Apply Score", "User Tools", "Reset"])
             
             with t1:
                 st.subheader("Start New Round")
                 nr = st.text_input("Round Name")
-                ns = st.text_input("Active Subjects")
+                ns = st.text_input("Active Subjects (Comma separated, e.g. Maths, Physics)")
                 if st.button("Start Round"):
                     c = db_conn.cursor()
                     c.execute("UPDATE game_state SET is_active=0")
@@ -202,28 +203,35 @@ else:
             with t3:
                 st.subheader("Add Score")
                 st_n = st.selectbox("Student", [p['name'] for p in MARKET_DATA])
-                sub_opts = [s.strip() for s in info['subjects'].split(",")] if info['subjects'] != "N/A" else ["General"]
-                sub_n = st.selectbox("Subject", sub_opts)
+                
+                # FIX: Splitting the subjects string so you can select one specifically
+                if info['subjects'] != "N/A":
+                    # We use comma splitting to turn "Math, Hass, English" into a list
+                    raw_sub_list = [s.strip() for s in info['subjects'].replace(" ", ",").split(",") if s.strip()]
+                    sub_opts = list(set(raw_sub_list)) # Remove duplicates
+                else:
+                    sub_opts = ["General"]
+                
+                sub_n = st.selectbox("Select Subject", sub_opts)
                 mk = st.number_input("Mark", 0.0, 100.0)
+                
                 if st.button("Apply Score"):
                     c = db_conn.cursor()
                     new_pts = calculate_fpl_points(mk)
                     c.execute("INSERT INTO score_history (round_name, student, subject, mark, points) VALUES (?,?,?,?,?)", (info['round_name'], st_n, sub_n, mk, new_pts))
+                    # Distribute points to managers who own this student
                     for u_n, u_t, u_c, u_tc_act in c.execute("SELECT username, team, captain, tc_active FROM users").fetchall():
                         if u_t and st_n in u_t:
                             m = 3 if (st_n == u_c and u_tc_act == 1) else (2 if st_n == u_c else 1)
                             c.execute("UPDATE users SET total_points = total_points + ? WHERE username=?", (new_pts * m, u_n))
-                    db_conn.commit(); st.success("Done!")
+                    db_conn.commit(); st.success(f"Added {new_pts:.1f} pts for {st_n} in {sub_n}!")
 
             with t4:
-                # View Passwords still visible here
                 u_df = pd.read_sql("SELECT username, password, total_points, tc_available FROM users", db_conn)
                 st.dataframe(u_df, use_container_width=True)
-                
                 target = st.selectbox("User", u_df['username'].tolist())
                 new_p = st.text_input("New Password for User")
                 adj = st.number_input("Manual Adjust Pts", value=0.0)
-                
                 c1, c2, c3 = st.columns(3)
                 if c1.button("Update User Pass"):
                     db_conn.execute("UPDATE users SET password=? WHERE username=?", (new_p, target))
