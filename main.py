@@ -18,21 +18,18 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS score_history 
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, round_name TEXT, student TEXT, subject TEXT, mark REAL, points REAL)''')
     
-    # MIGRATION: This checks if the new column exists so it doesn't crash OR wipe your data
+    # MIGRATION: Keeps your data safe while fixing structure
     cursor = conn.execute('PRAGMA table_info(game_state)')
     cols = [info[1] for info in cursor.fetchall()]
     if 'is_active' not in cols:
-        # We rename the old one to keep data safe, then merge if needed
-        c.execute('ALTER TABLE game_state RENAME TO old_game_state')
-        c.execute('''CREATE TABLE game_state 
-                     (id INTEGER PRIMARY KEY AUTOINCREMENT, round_name TEXT, subjects TEXT, is_active INTEGER DEFAULT 1)''')
-        c.execute("INSERT INTO game_state (round_name, subjects, is_active) SELECT round_name, subjects, 1 FROM old_game_state")
+        c.execute('ALTER TABLE game_state ADD COLUMN is_active INTEGER DEFAULT 0')
     conn.commit()
     return conn
 
 db_conn = init_db()
 
 # --- ADMIN PASSWORD SECURITY ---
+# Forrest can't see this on GitHub if you put it in Streamlit Secrets
 ADMIN_PASSWORD = st.secrets.get("ADMIN_KEY", "vinodbox43")
 
 def calculate_fpl_points(mark):
@@ -60,7 +57,6 @@ player_options = [f"{p['name']} (£{p['price']}m)" for p in MARKET_DATA]
 st.markdown("""<style>
     .stApp { background-color: #FFFFFF; }
     label, p, .stMarkdown { color: #000000 !important; font-weight: 700 !important; }
-    input { color: #000000 !important; background-color: #fcfcfc !important; border: 2px solid #38003c !important; }
     .fpl-header { background: #38003c; padding: 20px; border-radius: 10px; border-bottom: 5px solid #00ff87; text-align: center; margin-bottom: 25px; }
     .card { background: #f0f2f6; padding: 15px; border-radius: 10px; border-left: 5px solid #38003c; margin-bottom: 10px; color: #38003c; }
     </style>""", unsafe_allow_html=True)
@@ -68,12 +64,13 @@ st.markdown("""<style>
 if 'auth' not in st.session_state: st.session_state.auth = False
 if 'user' not in st.session_state: st.session_state.user = None
 
-# --- AUTH & MAIN APP ---
+# --- APP LOGIC ---
 if not st.session_state.auth:
     st.markdown('<div class="fpl-header"><h1 style="color:#00ff87;">GATE FANTASY</h1></div>', unsafe_allow_html=True)
     t1, t2 = st.tabs(["Login", "Sign Up"])
     with t1:
-        u_in, p_in = st.text_input("Username"), st.text_input("Password", type="password")
+        u_in = st.text_input("Username")
+        p_in = st.text_input("Password", type="password")
         if st.button("Log In", type="primary"):
             res = db_conn.execute("SELECT * FROM users WHERE username=? AND password=?", (u_in, p_in)).fetchone()
             if res:
@@ -88,6 +85,7 @@ if not st.session_state.auth:
                 st.success("Registered!")
             except: st.error("User exists.")
 else:
+    # Get fresh user data every time to prevent "Broken" session exploits
     u_data = pd.read_sql("SELECT * FROM users WHERE username=?", db_conn, params=(st.session_state.user,)).iloc[0]
     active_q = pd.read_sql("SELECT * FROM game_state WHERE is_active=1 LIMIT 1", db_conn)
     info = active_q.iloc[0] if not active_q.empty else {"round_name": "Round 1", "subjects": "Maths"}
@@ -122,7 +120,7 @@ else:
         st.header("📝 Grade History")
         raw = pd.read_sql("SELECT student, subject, mark FROM score_history", db_conn)
         if not raw.empty:
-            # FIX: This prevents duplicate columns from crashing the pivot
+            # Pivot fix to prevent "Object" errors in tables
             pivot_table = raw.pivot_table(index='student', columns='subject', values='mark', aggfunc='first').fillna("-")
             st.dataframe(pivot_table, use_container_width=True)
 
@@ -147,7 +145,7 @@ else:
         if st.button("Save Squad"):
             if len(s_names) == 5 and cost <= 90:
                 c = db_conn.cursor()
-                # Catch-up logic for current round scores
+                # Catch-up logic
                 round_scores = c.execute("SELECT student, points FROM score_history WHERE round_name=?", (info['round_name'],)).fetchall()
                 total_catchup = 0
                 for s_n, s_p in round_scores:
@@ -182,7 +180,7 @@ else:
             with t1:
                 st.subheader("Start New Round")
                 nr = st.text_input("Round Name")
-                ns = st.text_input("Active Subjects (Comma separated, e.g. Maths, Physics)")
+                ns = st.text_input("Active Subjects (Comma separated)")
                 if st.button("Start Round"):
                     c = db_conn.cursor()
                     c.execute("UPDATE game_state SET is_active=0")
@@ -204,42 +202,34 @@ else:
                 st.subheader("Add Score")
                 st_n = st.selectbox("Student", [p['name'] for p in MARKET_DATA])
                 
-                # FIX: Splitting the subjects string so you can select one specifically
-                if info['subjects'] != "N/A":
-                    # We use comma splitting to turn "Math, Hass, English" into a list
-                    raw_sub_list = [s.strip() for s in info['subjects'].replace(" ", ",").split(",") if s.strip()]
-                    sub_opts = list(set(raw_sub_list)) # Remove duplicates
-                else:
-                    sub_opts = ["General"]
+                # FIXED: This splits the subject string so they aren't clumped together
+                subject_string = info['subjects'] if info['subjects'] else "General"
+                # Split by space OR comma to be safe
+                sub_list = [s.strip() for s in subject_string.replace(",", " ").split(" ") if s.strip()]
+                sub_n = st.selectbox("Select Subject", list(set(sub_list)))
                 
-                sub_n = st.selectbox("Select Subject", sub_opts)
                 mk = st.number_input("Mark", 0.0, 100.0)
-                
                 if st.button("Apply Score"):
                     c = db_conn.cursor()
                     new_pts = calculate_fpl_points(mk)
                     c.execute("INSERT INTO score_history (round_name, student, subject, mark, points) VALUES (?,?,?,?,?)", (info['round_name'], st_n, sub_n, mk, new_pts))
-                    # Distribute points to managers who own this student
+                    # Point distribution logic
                     for u_n, u_t, u_c, u_tc_act in c.execute("SELECT username, team, captain, tc_active FROM users").fetchall():
                         if u_t and st_n in u_t:
                             m = 3 if (st_n == u_c and u_tc_act == 1) else (2 if st_n == u_c else 1)
                             c.execute("UPDATE users SET total_points = total_points + ? WHERE username=?", (new_pts * m, u_n))
-                    db_conn.commit(); st.success(f"Added {new_pts:.1f} pts for {st_n} in {sub_n}!")
+                    db_conn.commit(); st.success(f"Score added!")
 
             with t4:
+                # View Passwords still visible here for you
                 u_df = pd.read_sql("SELECT username, password, total_points, tc_available FROM users", db_conn)
                 st.dataframe(u_df, use_container_width=True)
                 target = st.selectbox("User", u_df['username'].tolist())
-                new_p = st.text_input("New Password for User")
-                adj = st.number_input("Manual Adjust Pts", value=0.0)
-                c1, c2, c3 = st.columns(3)
-                if c1.button("Update User Pass"):
+                new_p = st.text_input("New Password")
+                if st.button("Update Pass"):
                     db_conn.execute("UPDATE users SET password=? WHERE username=?", (new_p, target))
-                    db_conn.commit(); st.success("Pass Updated!")
-                if c2.button("Fix Pts"):
-                    db_conn.execute("UPDATE users SET total_points = total_points + ? WHERE username=?", (adj, target))
-                    db_conn.commit(); st.rerun()
-                if c3.button("Restore TC"):
+                    db_conn.commit(); st.success("Updated!")
+                if st.button("Restore TC"):
                     db_conn.execute("UPDATE users SET tc_available=1, tc_active=0 WHERE username=?", (target,))
                     db_conn.commit(); st.success("TC Refilled")
 
@@ -253,4 +243,4 @@ else:
                             if u_t and s_name in u_t:
                                 m = 3 if (s_name == u_c and u_tc_av == 0) else (2 if s_name == u_c else 1)
                                 c.execute("UPDATE users SET total_points = total_points + ? WHERE username=?", (s_pts * m, u_n))
-                    db_conn.commit(); st.success("Leaderboard Rebuilt!"); st.rerun()
+                    db_conn.commit(); st.success("Rebuilt!"); st.rerun()
