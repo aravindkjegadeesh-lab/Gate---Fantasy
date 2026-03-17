@@ -31,6 +31,10 @@ def init_db():
 
 db_conn = init_db()
 
+# --- ADMIN PASSWORD SECURITY ---
+# This pulls from Streamlit's secrets. If not set, it defaults to your old one.
+ADMIN_PASSWORD = st.secrets.get("ADMIN_KEY", "vinodbox43")
+
 def calculate_fpl_points(mark):
     diff = mark - 70
     return 4 * math.pow(diff, 1.2) if diff >= 0 else -4 * math.pow(abs(diff), 1.2)
@@ -111,14 +115,14 @@ else:
         st.header("📊 Total Student Points")
         stats = pd.read_sql("SELECT student as Name, SUM(points) as Total_Points FROM score_history GROUP BY student ORDER BY Total_Points DESC", db_conn)
         if not stats.empty:
-            stats['Total_Points'] = pd.to_numeric(stats['Total_Points']).round(2)
+            stats['Total_Points'] = pd.to_numeric(stats['Total_Points']).round(2) #
             st.dataframe(stats, use_container_width=True, hide_index=True)
 
     elif page == "Grade Portal":
         st.header("📝 Grade History")
         raw = pd.read_sql("SELECT student, subject, mark FROM score_history", db_conn)
         if not raw.empty:
-            pivot_table = raw.pivot_table(index='student', columns='subject', values='mark', aggfunc='first').fillna("-")
+            pivot_table = raw.pivot_table(index='student', columns='subject', values='mark', aggfunc='first').fillna("-") #
             st.dataframe(pivot_table, use_container_width=True)
 
     elif page == "My Squad":
@@ -142,7 +146,6 @@ else:
         if st.button("Save Squad"):
             if len(s_names) == 5 and cost <= 90:
                 c = db_conn.cursor()
-                # Catch-up for current round
                 round_scores = c.execute("SELECT student, points FROM score_history WHERE round_name=?", (info['round_name'],)).fetchall()
                 total_catchup = 0
                 for s_n, s_p in round_scores:
@@ -171,12 +174,13 @@ else:
 
     elif page == "Admin":
         st.header("🔐 Admin Controls")
-        if st.text_input("Admin Key", type="password") == "vinodbox43":
+        # Masked input for password and using the secured ADMIN_PASSWORD variable
+        if st.text_input("Enter Admin Key", type="password") == ADMIN_PASSWORD:
             t1, t2, t3, t4, t5 = st.tabs(["Set Round", "Round Archives", "Apply Score", "User Tools", "Reset"])
             
             with t1:
                 st.subheader("Start New Round")
-                nr = st.text_input("Round Name (e.g. Round 2)")
+                nr = st.text_input("Round Name")
                 ns = st.text_input("Active Subjects")
                 if st.button("Start Round"):
                     c = db_conn.cursor()
@@ -212,16 +216,16 @@ else:
                     db_conn.commit(); st.success("Done!")
 
             with t4:
-                # VIEW PASSWORDS INCLUDED HERE
+                # View Passwords still visible here
                 u_df = pd.read_sql("SELECT username, password, total_points, tc_available FROM users", db_conn)
                 st.dataframe(u_df, use_container_width=True)
                 
                 target = st.selectbox("User", u_df['username'].tolist())
-                new_p = st.text_input("Change Password (New Pass)")
+                new_p = st.text_input("New Password for User")
                 adj = st.number_input("Manual Adjust Pts", value=0.0)
                 
                 c1, c2, c3 = st.columns(3)
-                if c1.button("Update Pass"):
+                if c1.button("Update User Pass"):
                     db_conn.execute("UPDATE users SET password=? WHERE username=?", (new_p, target))
                     db_conn.commit(); st.success("Pass Updated!")
                 if c2.button("Fix Pts"):
